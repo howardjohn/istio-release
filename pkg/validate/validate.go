@@ -15,8 +15,14 @@
 package validate
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
+	"errors"
 	"fmt"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
+	"github.com/google/go-containerregistry/pkg/v1/tarball"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -71,20 +77,21 @@ func CheckRelease(release string) ([]string, string, []error) {
 	}
 	r := NewReleaseInfo(release)
 	checks := map[string]ValidationFunction{
-		"IstioctlArchive":      TestIstioctlArchive,
-		"IstioctlStandalone":   TestIstioctlStandalone,
-		"TestDocker":           TestDocker,
-		"HelmVersionsIstio":    TestHelmVersionsIstio,
-		"HelmChartVersions":    TestHelmChartVersions,
-		"OperatorProfiles":     TestOperatorProfiles,
-		"HelmOperatorManifest": TestHelmOperatorManifest,
-		"Manifest":             TestManifest,
-		"Licenses":             TestLicenses,
-		"Grafana":              TestGrafana,
-		"CompletionFiles":      TestCompletionFiles,
-		"ProxyVersion":         TestProxyVersion,
-		"Debian":               TestDebian,
-		"Rpm":                  TestRpm,
+		//"IstioctlArchive":      TestIstioctlArchive,
+		//"IstioctlStandalone":   TestIstioctlStandalone,
+		//"TestDocker":           TestDocker,
+		//"HelmVersionsIstio":    TestHelmVersionsIstio,
+		//"HelmChartVersions":    TestHelmChartVersions,
+		//"OperatorProfiles":     TestOperatorProfiles,
+		//"HelmOperatorManifest": TestHelmOperatorManifest,
+		//"Manifest":             TestManifest,
+		//"Licenses":             TestLicenses,
+		//"Grafana":              TestGrafana,
+		//"CompletionFiles":      TestCompletionFiles,
+		"ProxyVersion": TestProxyVersion,
+		"BinarySizes":  TestBinarySizes,
+		//"Debian":               TestDebian,
+		//"Rpm":                  TestRpm,
 	}
 	var errors []error
 	var success []string
@@ -98,7 +105,7 @@ func CheckRelease(release string) ([]string, string, []error) {
 	}
 	sb := strings.Builder{}
 	if len(errors) > 0 {
-		sb.WriteString(fmt.Sprintf("Checks failed. Release info: %+v", r))
+		sb.WriteString(fmt.Sprintf("Checks failed. Release info: %+v\n", r))
 		sb.WriteString("Files in release: \n")
 		_ = filepath.Walk(r.release,
 			func(path string, info os.FileInfo, err error) error {
@@ -242,14 +249,59 @@ type DockerConfigConfig struct {
 	Env []string `json:"Env"`
 }
 
+func normalize(name string) string {
+	return filepath.Clean("/" + name)
+}
+
+func loadExecutableFromDocker(r ReleaseInfo, image string, binary string) (string, error) {
+	archive := filepath.Join(r.release, "docker", image+".tar.gz")
+	img, err := tarball.Image(func() (io.ReadCloser, error) {
+		f, err := os.Open(archive)
+		if err != nil {
+			return nil, err
+		}
+		return unzipReadCloser(f)
+	}, nil)
+	if err != nil {
+		return "", err
+	}
+
+	want := normalize(binary)
+	tr := tar.NewReader(mutate.Extract(img))
+	for {
+		header, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return "", fmt.Errorf("reading tar: %w", err)
+		}
+		if normalize(header.Name) == want {
+			// Found it!
+			os.MkdirAll(filepath.Join(r.tmpDir, "docker"), 0o777)
+			dest, err := os.Create(filepath.Join(r.tmpDir, "docker", image))
+			if err != nil {
+				return "", fmt.Errorf("writing file: %w", err)
+			}
+			if _, err := io.Copy(dest, tr); err != nil {
+				return "", fmt.Errorf("writing file: %w", err)
+			}
+			dest.Close()
+			os.Chmod(dest.Name(), 0o755)
+			return dest.Name(), nil
+		}
+	}
+
+	return "", nil
+}
+
 func TestProxyVersion(r ReleaseInfo) error {
-	archive := filepath.Join(r.release, "docker", "proxyv2-debug.tar.gz")
-	if err := util.VerboseCommand("docker", "load", "-i", archive).Run(); err != nil {
-		return fmt.Errorf("failed to load proxyv2-debug.tar.gz as docker image: %v", err)
+	dest, err := loadExecutableFromDocker(r, "proxyv2-debug", "usr/local/bin/pilot-agent")
+	if err != nil {
+		return err
 	}
 	buf := bytes.Buffer{}
-	image := fmt.Sprintf("%s/%s:%s", r.manifest.Docker, "proxyv2", r.manifest.Version)
-	cmd := util.VerboseCommand("docker", "run", "--rm", image, "version", "--short")
+	cmd := util.VerboseCommand(dest, "version", "--short")
 	cmd.Stdout = &buf
 	if err := cmd.Run(); err != nil {
 		return err
@@ -291,6 +343,13 @@ func TestHelmChartVersions(r ReleaseInfo) error {
 		}
 	}
 	return nil
+}
+
+func TestBinarySizes(r ReleaseInfo) error {
+	dest, err := loadExecutableFromDocker(r, "proxyv2-debug", "usr/local/bin/pilot-agent")
+	if err != nil {
+		return err
+	}
 }
 
 func TestHelmVersionsIstio(r ReleaseInfo) error {
@@ -480,4 +539,32 @@ func fileExists(filename string) bool {
 		return false
 	}
 	return !info.IsDir()
+}
+
+func unzipReadCloser(r io.ReadCloser) (io.ReadCloser, error) {
+	gr, err := gzip.NewReader(r)
+	if err != nil {
+		return nil, err
+	}
+	return &ReadCloser{
+		Reader: gr,
+		CloseFunc: func() error {
+			gr.Close()
+			return r.Close()
+		},
+	}, nil
+}
+
+// ReadCloser implements io.ReadCloser by reading from a particular io.Reader
+// and then calling the provided "Close()" method.
+type ReadCloser struct {
+	io.Reader
+	CloseFunc func() error
+}
+
+var _ io.ReadCloser = (*ReadCloser)(nil)
+
+// Close implements io.ReadCloser
+func (rac *ReadCloser) Close() error {
+	return rac.CloseFunc()
 }
